@@ -85,6 +85,7 @@ import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMent
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
+import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { delay } from './utils/timing.js';
@@ -19204,7 +19205,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     flushIdentityCacheSync();
 
     removePidFile();
-    process.exit(0);
+    process.exit(gracefulProcessExitCode());
   };
 
   process.on('SIGTERM', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });

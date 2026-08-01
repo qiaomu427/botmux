@@ -11,6 +11,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
+import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
@@ -5363,9 +5364,9 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
-  server.close(() => process.exit(0));
+  server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s
-  setTimeout(() => process.exit(0), 5_000).unref();
+  setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

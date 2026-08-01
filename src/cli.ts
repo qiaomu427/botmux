@@ -91,6 +91,7 @@ import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveC
 import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
+import { pm2ManagedExitConfig } from './pm2-graceful-exit.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import { withFileLockSync } from './utils/file-lock.js';
@@ -498,6 +499,7 @@ function ecosystemConfig(activationAppId?: string): string {
     process.env,
     existsSync(ENV_FILE) ? readFileSync(ENV_FILE, 'utf-8') : undefined,
   );
+  const managedExit = pm2ManagedExitConfig();
 
   const baseApp = {
     script: daemonScript,
@@ -509,14 +511,14 @@ function ecosystemConfig(activationAppId?: string): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
-    // A graceful daemon shutdown exits 0 (SIGTERM/SIGINT → drain → process.exit(0)).
-    // Tell pm2 that exit 0 is intentional so it does NOT autorestart the daemon
+    // A graceful PM2-managed shutdown exits with a dedicated sentinel code.
+    // Tell pm2 that only this code is intentional so it does NOT autorestart the daemon
     // while `botmux restart` is tearing the fleet down — otherwise pm2 revives
     // each daemon (after restart_delay) the instant our parallel SIGTERM drains
     // it, and re-deleting those revivals one-by-one re-serializes the teardown
-    // (~13s of churn for 31 bots). Crashes (non-zero exit / killed by signal)
-    // are NOT in this list, so genuine crash-autorestart is preserved.
-    stop_exit_codes: [0],
+    // (~13s of churn for 31 bots). Do not use 0 here: PM2 normalizes a signal
+    // exit's null code to 0, which would suppress autorestart after SIGKILL.
+    stop_exit_codes: managedExit.stopExitCodes,
     // pm2's default kill_timeout (1.6s) is SHORTER than the daemon's own
     // SHUTDOWN_GRACE_MS (3s), so any daemon pm2 has to signal directly gets
     // SIGKILL'd mid-drain → orphaned (ppid=1) workers. Give pm2 headroom past
@@ -577,6 +579,7 @@ function ecosystemConfig(activationAppId?: string): string {
       out_file: join(LOG_DIR, `daemon-${i}-out.log`),
       env: {
         ...daemonEnv,
+        ...managedExit.env,
         SESSION_DATA_DIR: DATA_DIR,
         BOTMUX_BOT_INDEX: String(i),
         BOTMUX_LARK_APP_ID: appId,
@@ -602,15 +605,16 @@ function ecosystemConfig(activationAppId?: string): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
-    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit-0
+    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit
     // during a fleet teardown, and don't SIGKILL mid-shutdown. (See baseApp.)
-    stop_exit_codes: [0],
+    stop_exit_codes: managedExit.stopExitCodes,
     kill_timeout: 3500,
     error_file: join(LOG_DIR, 'dashboard-error.log'),
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
     env: {
       ...daemonEnv,
+      ...managedExit.env,
       // MUST match the bot daemons' SESSION_DATA_DIR: the dashboard shares
       // pairings/federations/memberships with them via {dataDir}/*.json. Without
       // it the dashboard falls back to an install-relative ../data and reads a
