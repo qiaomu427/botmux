@@ -2740,8 +2740,53 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           })).catch(err => logger.error(`Error handling bot message listener event: ${err}`));
           return;
         }
-        // Foreign bot: only route on @mention of us.
-        if (!isBotMentioned(larkAppId, message, undefined)) return;
+        // Foreign bot: only route on @mention of us — with one exception.
+        //
+        // 主动开工 — 场景② (bot sender): 「话题群新话题自动开工」(autoStartOnNewTopic)
+        // 覆盖到「其他机器人开的新话题」。人分支在 3271 对非 @ 的话题群新话题种子做
+        // 同一判定；bot 消息走本分支，若不在这里补一个等价出口，就会在下面这行 return
+        // 掉——所以 bot 开的新话题永远到不了人分支的场景②。判定复用同一个纯函数
+        // shouldAutoStartOnNewTopic（形态门：thread-scope + anchor===本消息 + 无会话
+        // 占用，天然只认「全新话题种子」，不认话题内回复，故不会自我循环——回复锚定在
+        // 话题根 anchor≠messageId），触发范围额外收敛到 evaluateBotTalk 认可的团队 /
+        // 已知 peer bot（不放行任意陌生 bot），并要求飞书真的把这条非 @ 的 bot 消息推
+        // 过来（依赖 im:message.group_bot_msg:readonly scope；缺则事件根本不到，静默降级）。
+        //
+        // 收到 im:message.group_bot_msg:readonly 推来的「其他机器人发的群消息」后，只有
+        // 满足上述全部条件才免 @ 自动开工；否则保持原有「未 @ 即忽略」语义。
+        if (!isBotMentioned(larkAppId, message, undefined)) {
+          if (getBot(larkAppId).config.autoStartOnNewTopic === true && chatType === 'group') {
+            const seedDecision = await decideRoutingWithSource(larkAppId, message);
+            // 与人分支 3041-3042 同源：只有真正的话题群顶层种子（source==='topic-chat'）
+            // 才是自动开工候选；普通群 /t / 新话题模式产生的同形 {thread, anchor=msg} 不算。
+            const seedScope = seedDecision.source === 'topic-chat' ? seedDecision.scope : 'chat';
+            const seedAnchor = seedDecision.source === 'topic-chat' ? seedDecision.anchor : chatId;
+            const seedOwnsSession = seedScope === 'thread'
+              ? (handlers.isSessionOwner?.(seedAnchor, larkAppId) ?? false)
+              : false;
+            const autoTopic = shouldAutoStartOnNewTopic({
+              enabled: true,
+              scope: seedScope,
+              anchor: seedAnchor,
+              messageId,
+              chatType,
+              ownsSession: seedOwnsSession,
+            });
+            // peer 门：只对团队 / 已知 peer bot 开的新话题自动开工，不放行陌生 bot。
+            const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+            if (autoTopic && seedBotTalk.allowed) {
+              logger.info(
+                `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题免@自动开工 ` +
+                `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'} reason=${seedBotTalk.reason}`,
+              );
+              const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
+              await dispatchHumanMessage({ data, ctx: seedCtx, ownsSession: false })
+                .catch(err => logger.error(`Error auto-starting on foreign-bot new topic: ${err}`));
+              return;
+            }
+          }
+          return;
+        }
         const decision = await decideRoutingWithSource(larkAppId, message);
         const ctx = { scope: decision.scope, anchor: decision.anchor };
         // Honor `/t` / `/topic` from bot senders too, aligning with the human

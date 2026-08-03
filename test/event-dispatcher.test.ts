@@ -5818,6 +5818,160 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
   });
 });
 
+describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic, bot sender / 其他机器人开的新话题)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockReplyMessage.mockClear();
+    mockResolveSiblingBot.mockReset();
+    mockResolveSiblingBot.mockResolvedValue({ ok: false, reason: 'default_no_sibling' });
+    mockGetOwnerOpenId.mockReset();
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockReset();
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(false);
+  });
+
+  /** setupBotState with a non-empty allowlist (limited mode) that excludes the
+   *  foreign bot, so a non-@ bot message deterministically returns 'ignore' and
+   *  exercises the auto-topic branch rather than an open-mode relaxation. */
+  function setupAutoTopicBotSender(enabled: boolean, knownPeer: boolean) {
+    setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: enabled });
+    // knownPeer → cross-ref hit → isKnownPeerBot true → evaluateBotTalk allows.
+    // Otherwise the foreign bot is unknown → peer gate rejects.
+    mockReadFileSync.mockReturnValue(knownPeer ? JSON.stringify({ SiblingBot: OTHER_BOT_OPEN_ID }) : '{}');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  }
+
+  /** A topic-group top-level seed FROM ANOTHER BOT: no root_id / thread_id so
+   *  decideRouting lands on {scope:'thread', anchor:messageId, source:'topic-chat'}. */
+  function makeBotTopicSeed(messageId: string, chatId: string) {
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '我先起个新话题看看这个仓库' }),
+      messageId,
+      chatId,
+      chatType: 'group',
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    event.message.thread_id = undefined as any;
+    return event;
+  }
+
+  it('已知 peer bot 开新话题（未 @）+ 开关开 → 自动开工', async () => {
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotTopicSeed('msg-bot-seed-1', 'chat-bot-topic-1');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-seed-1',
+      larkAppId: MY_APP_ID,
+    }));
+    // 未弹授权卡（走的是自动开工，不是 @blocked 授权路径）
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('已知 peer bot 开新话题（未 @）+ 开关关 → 不触发', async () => {
+    setupAutoTopicBotSender(false, true);
+    const event = makeBotTopicSeed('msg-bot-seed-off', 'chat-bot-topic-off');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('陌生外部 bot（非 peer）开新话题（未 @）+ 开关开 → 不触发（peer 门挡住）', async () => {
+    setupAutoTopicBotSender(true, false);
+    const event = makeBotTopicSeed('msg-bot-seed-stranger', 'chat-bot-topic-stranger');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('peer bot 话题内回复（有 root_id+thread_id，非新话题种子）→ 不触发（形态门 = 防自我循环的核心）', async () => {
+    // 这是「自动开工的产物是回复到话题内，不会再触发自动开工」的直接证据：
+    // 一条带 root_id+thread_id 的 bot 回复走 real-thread 分支（anchor=root≠messageId），
+    // shouldAutoStartOnNewTopic 的 anchor===messageId 形态门为假 → 绝不自动开工。
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '这是我在已有话题里的一条后续回复' }),
+      messageId: 'msg-bot-reply',
+      chatId: 'chat-bot-topic-reply',
+      chatType: 'group',
+      rootId: 'root-existing-topic',
+      threadId: 'root-existing-topic',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('普通群 peer bot 消息（chat_mode=group，未 @）+ 开关开 → 不触发（非 topic-chat 种子）', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: true });
+    mockReadFileSync.mockReturnValue(JSON.stringify({ SiblingBot: OTHER_BOT_OPEN_ID }));
+    mockGetChatMode.mockReset();
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeBotTopicSeed('msg-bot-plain', 'chat-bot-plain');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('peer bot @ 到本 bot 的新话题 → 走原有 @ 路径（未被自动开工分支吞掉）', async () => {
+    // 回归保护：@ 到本 bot 时不进自动开工分支（isBotMentioned 为真），
+    // 仍按既有 bot-to-bot @mention 逻辑路由（bot @ 路径无条件走 handleThreadReply，
+    // 见 dispatcher 的 "Bot-to-bot @mention detected" 分支）。
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }, { tag: 'text', text: ' 帮我看下' }]] } }),
+      messageId: 'msg-bot-at-seed',
+      chatId: 'chat-bot-at-seed',
+      chatType: 'group',
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    event.message.thread_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // @ 到 + peer 放行 → 既有 bot @mention 路径（handleThreadReply, anchor=种子 msgId），
+    // 而不是被本次新增的「未 @ 自动开工」分支处理（那条分支的 return 出口在 isBotMentioned 为真时不进入）。
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-at-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe('im.message.receive_v1 — /summary command', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
