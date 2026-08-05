@@ -142,20 +142,61 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(resolveSessionReplyTarget(ds, 'turn-t')).toEqual({ mode: 'thread', rootMessageId: 'om_thread_turn' });
   });
 
-  it('pickTurnReplyTarget prefers the exact per-turn entry and falls back to the slot', () => {
+  it('pickTurnReplyTarget prefers the exact per-turn entry and never borrows a mismatched slot', () => {
     const ds = makeDs() as DaemonSession;
     beginBoth(ds, 'a');
-    expect(pickTurnReplyTarget(ds.session, 'turn-a')).toEqual({ rootMessageId: 'om_trigger_a', turnId: 'turn-a', quoteOnly: false, substitute: true });
-    // Unknown turn → the (latest) single slot, preserving legacy behavior for
-    // sessions persisted before the map existed.
-    expect(pickTurnReplyTarget({ currentReplyTarget: ds.session.currentReplyTarget }, 'turn-x')?.turnId).toBe('turn-b');
+    expect(pickTurnReplyTarget(ds.session, 'turn-a')).toMatchObject({ rootMessageId: 'om_trigger_a', turnId: 'turn-a', quoteOnly: false, substitute: true });
+    expect(pickTurnReplyTarget({ currentReplyTarget: ds.session.currentReplyTarget }, 'turn-x')).toBeUndefined();
+  });
+
+  it('binds thread-scope senders per turn even though routing needs no per-turn root', () => {
+    const ds = makeDs({ scope: 'thread' }) as DaemonSession;
+    ds.session.rootMessageId = 'om_thread_root';
+    beginReplyTargetTurn(ds, undefined, 'turn-a', NOW, { senderOpenId: 'ou_bot_a' });
+    beginReplyTargetTurn(ds, undefined, 'turn-b', NOW, { senderOpenId: 'ou_human_b' });
+
+    expect(pickTurnReplyTarget(ds.session, 'turn-a')).toMatchObject({ turnId: 'turn-a', senderOpenId: 'ou_bot_a' });
+    expect(pickTurnReplyTarget(ds.session, 'turn-b')).toMatchObject({ turnId: 'turn-b', senderOpenId: 'ou_human_b' });
+    expect(resolveSessionReplyTarget(ds, 'turn-a')).toEqual({ mode: 'thread', rootMessageId: 'om_thread_root' });
+  });
+
+  it('keeps rootless chat sender A separate from topic sender/root B', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, undefined, 'turn-a', NOW, { senderOpenId: 'ou_a' });
+    beginReplyTargetTurn(ds, 'om_b', 'turn-b', NOW, { senderOpenId: 'ou_b', substitute: true });
+
+    expect(pickTurnReplyTarget(ds.session, 'turn-a')).toMatchObject({ turnId: 'turn-a', senderOpenId: 'ou_a' });
+    expect(pickTurnReplyTarget(ds.session, 'turn-a')?.rootMessageId).toBeUndefined();
+    expect(pickTurnReplyTarget(ds.session, 'turn-b')).toMatchObject({ turnId: 'turn-b', rootMessageId: 'om_b', senderOpenId: 'ou_b' });
+    expect(resolveSessionReplyTarget(ds, 'turn-a')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('legacy slots are accepted only when their turnId matches exactly', () => {
+    const exact = {
+      currentReplyTarget: { rootMessageId: 'om_a', turnId: 'turn-a', updatedAt: NOW },
+      quoteTargetId: 'turn-a',
+      quoteTargetSenderOpenId: 'ou_a',
+    };
+    expect(pickTurnReplyTarget(exact, 'turn-a')).toMatchObject({
+      turnId: 'turn-a', rootMessageId: 'om_a', senderOpenId: 'ou_a',
+    });
+
+    const mismatched = {
+      currentReplyTarget: { rootMessageId: 'om_a', turnId: 'turn-a', updatedAt: NOW },
+      quoteTargetId: 'turn-b',
+      quoteTargetSenderOpenId: 'ou_b',
+    };
+    expect(pickTurnReplyTarget(mismatched, 'turn-a')).toMatchObject({ turnId: 'turn-a', rootMessageId: 'om_a' });
+    expect(pickTurnReplyTarget(mismatched, 'turn-a')?.senderOpenId).toBeUndefined();
+    expect(pickTurnReplyTarget(mismatched, 'turn-b')).toMatchObject({ turnId: 'turn-b', senderOpenId: 'ou_b' });
+    expect(pickTurnReplyTarget(mismatched, 'turn-b')?.rootMessageId).toBeUndefined();
   });
 
   it('a rootless normal turn is NOT judged substitute after a substitute turn overwrites the slot (codex delta repro)', () => {
     // Real sequence for 普通群 replyMode=chat: a top-level normal @bot turn has
-    // no replyRootId (begin clears the slot, writes NO map entry); then a
-    // substitute trigger B begins. Turn A must not inherit B's flag via the
-    // slot fallback.
+    // no replyRootId (begin clears the routing slot but retains per-turn
+    // sender/flags); then a substitute trigger B begins. Turn A must not
+    // inherit B's flag via the slot fallback.
     const ds = makeDs() as DaemonSession;
     beginReplyTargetTurn(ds, undefined, 'turn-normal-a', NOW);
     beginReplyTargetTurn(ds, 'om_trigger_b', 'turn-sub-b', NOW, { quoteOnly: false, substitute: true });
@@ -183,10 +224,10 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(isSubstituteTurn(ds)).toBe(false); // slot cleared by the rootless turn
   });
 
-  it('bounds the map and evicted turns degrade to the legacy single-slot behavior', () => {
+  it('bounds the map and an evicted in-flight turn cannot borrow the latest sender', () => {
     const ds = makeDs() as DaemonSession;
     for (let i = 0; i < 40; i++) {
-      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(Date.parse(NOW) + i * 1000).toISOString());
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(Date.parse(NOW) + i * 1000).toISOString(), { senderOpenId: `ou_${i}` });
     }
     const keys = Object.keys(ds.session.replyTargets ?? {});
     expect(keys.length).toBe(32);
@@ -194,5 +235,7 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(keys).toContain('turn-39');
     // Evicted turn: map miss + slot mismatch → plain (pre-map behavior).
     expect(resolveSessionReplyTarget(ds, 'turn-0')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+    expect(pickTurnReplyTarget(ds.session, 'turn-0')).toBeUndefined();
+    expect(pickTurnReplyTarget(ds.session, 'turn-39')?.senderOpenId).toBe('ou_39');
   });
 });

@@ -115,6 +115,17 @@ export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited';
 /** Status shown on a streaming card — adds the pre-spawn 'starting' phase. */
 export type StreamStatus = ScreenStatus | 'starting';
 
+/** Reply context bound to one exact inbound turn. `rootMessageId` is absent
+ * for thread-scope and rootless chat turns, which still need an immutable
+ * sender for `--mention-back`. */
+export interface ReplyTargetEntry {
+  rootMessageId?: string;
+  updatedAt: string;
+  quoteOnly?: boolean;
+  substitute?: boolean;
+  senderOpenId?: string;
+}
+
 export interface Session {
   sessionId: string;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
@@ -295,12 +306,12 @@ export interface Session {
    * Per-turn reply targets keyed by turnId (the inbound message_id that opened
    * the turn). currentReplyTarget above only remembers the LATEST turn — when
    * turns queue up (e.g. two substitute triggers, or a trigger while the CLI is
-   * busy) the earlier turn's send would see a mismatched turnId and degrade to
-   * a top-level plain send. `botmux send` and the daemon resolve the executing
-   * turn against this map first. Bounded (oldest pruned); evicted turns fall
-   * back to the single-slot behavior.
+   * busy) the earlier turn must retain both its routing anchor and sender.
+   * `botmux send` and the daemon resolve the executing turn against this map
+   * first. Bounded (oldest pruned); an evicted turn may use legacy fields only
+   * when their turnId still exactly matches, otherwise it fails closed.
    */
-  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  replyTargets?: Record<string, ReplyTargetEntry>;
   /**
    * Durable receiver acknowledgement keyed by the exact inbound Lark
    * message_id. A receipt is written only after the worker has committed that
@@ -329,7 +340,8 @@ export interface Session {
    * deliverFinalOutput / botmux send 成功路径清理对应 entry。
    */
   docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
-  /** open_id of the quote-target message's sender — used by --mention-back. */
+  /** Latest quote-target sender. Kept for UI/legacy compatibility; turn-bound
+   * `replyTargets[turnId].senderOpenId` is authoritative for --mention-back. */
   quoteTargetSenderOpenId?: string;
   /** Whether the quote-target sender is a bot (vs a human) — drives the
    *  @ hard-gate's context-aware error text. */

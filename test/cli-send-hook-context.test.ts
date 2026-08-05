@@ -24,10 +24,13 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/replyMessage\(\s*appId,\s*sendTarget\.rootMessageId,\s*content,\s*msgType,\s*sendTarget\.mode === 'thread',\s*uuid,\s*hookContext,/);
   });
 
-  it('resolves mention-back from the explicit VC turn instead of the latest queued sender', () => {
+  it('resolves mention-back from the exact turn instead of the latest queued sender', () => {
     expect(cliSource).toContain(
       'const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId',
     );
+    expect(cliSource).toContain('?? turnReplyTarget?.senderOpenId');
+    expect(cliSource).not.toContain('shouldBlockMentionBackByParticipants');
+    expect(cliSource).not.toMatch(/mentionBack[\s\S]{0,500}getGroupStats/);
     expect(cliSource).toContain('hasQuoteTargetSender: !!replyTargetSenderOpenId');
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
   });

@@ -1,39 +1,44 @@
 import type { DaemonSession } from './types.js';
-import type { Session } from '../types.js';
+import type { ReplyTargetEntry, Session } from '../types.js';
 
 export type SessionReplyTarget =
   | { mode: 'plain'; chatId: string }
   | { mode: 'thread'; rootMessageId: string }
   | { mode: 'quote'; rootMessageId: string };
 
-/** Per-turn reply-target entry persisted in `Session.replyTargets` (keyed by
- *  turnId, so the key is not repeated inside the value). */
-export interface ReplyTargetEntry {
-  rootMessageId: string;
-  updatedAt: string;
-  quoteOnly?: boolean;
-  substitute?: boolean;
-}
-
-/** Bound on `Session.replyTargets`: chat-scope sessions are long-lived and a
- *  busy substitute group could otherwise grow the map without limit. 32 keeps
- *  every plausibly-still-in-flight turn (queue depth is far smaller) while the
- *  oldest entries fall off. Evicted turns degrade to the single-slot
- *  currentReplyTarget path — same behavior as before the map existed. */
+/** Bound on `Session.replyTargets`: long-lived sessions could otherwise grow
+ * without limit. An evicted turn may use a legacy slot only when its turnId
+ * still matches exactly; it never borrows a later turn's sender. */
 const REPLY_TARGETS_MAX = 32;
 
-/** The reply target for a SPECIFIC turn: exact per-turn entry first, then the
- *  single-slot currentReplyTarget (which only remembers the latest turn — with
- *  queued/concurrent turns an earlier turn would otherwise lose its anchor). */
+export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
+  turnId: string;
+  updatedAt?: string;
+}
+
+/** Reply context for one exact turn. The per-turn entry is authoritative. Old
+ * persisted sessions may fall back to the single slots only when those slots
+ * explicitly identify the requested turn. */
 export function pickTurnReplyTarget(
-  s: Pick<Session, 'replyTargets' | 'currentReplyTarget'>,
+  s: Pick<Session, 'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId'>,
   currentTurnId: string | undefined,
-): { rootMessageId: string; turnId: string; quoteOnly?: boolean; substitute?: boolean } | undefined {
+): TurnReplyTarget | undefined {
   if (currentTurnId) {
     const entry = s.replyTargets?.[currentTurnId];
-    if (entry?.rootMessageId) {
-      return { rootMessageId: entry.rootMessageId, turnId: currentTurnId, quoteOnly: entry.quoteOnly, substitute: entry.substitute };
+    const legacySender = s.quoteTargetId === currentTurnId
+      ? s.quoteTargetSenderOpenId
+      : undefined;
+    if (entry) {
+      const senderOpenId = entry.senderOpenId ?? legacySender;
+      return { ...entry, turnId: currentTurnId, ...(senderOpenId ? { senderOpenId } : {}) };
     }
+    const slot = s.currentReplyTarget?.turnId === currentTurnId
+      ? s.currentReplyTarget
+      : undefined;
+    if (slot || legacySender) {
+      return { ...slot, turnId: currentTurnId, ...(legacySender ? { senderOpenId: legacySender } : {}) };
+    }
+    return undefined;
   }
   return s.currentReplyTarget;
 }
@@ -51,9 +56,8 @@ export function isSubstituteTurn(
     const entry = ds.session.replyTargets?.[turnId];
     if (entry) return entry.substitute === true;
     // With explicit turn context, the single slot only speaks for ITS OWN
-    // turn. A rootless normal turn leaves no map entry (begin cleared the
-    // slot) — it must not inherit a later substitute turn's flag after that
-    // turn overwrote the slot (and vice versa).
+    // turn. It must not inherit a later turn's flag after that turn overwrote
+    // the slot (and vice versa).
     return !!slot && slot.turnId === turnId && slot.substitute === true;
   }
   return slot?.substitute === true;
@@ -112,8 +116,28 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string },
 ): void {
+  // Routing and sender are one atomic per-turn record. Thread-scope and
+  // rootless chat turns may have no rootMessageId, but still require their
+  // exact sender for --mention-back.
+  const targets = { ...(ds.session.replyTargets ?? {}) };
+  targets[turnId] = {
+    ...(replyRootId ? { rootMessageId: replyRootId } : {}),
+    updatedAt: nowIso,
+    quoteOnly: opts?.quoteOnly,
+    substitute: opts?.substitute,
+    ...(opts?.senderOpenId ? { senderOpenId: opts.senderOpenId } : {}),
+  };
+  const keys = Object.keys(targets);
+  if (keys.length > REPLY_TARGETS_MAX) {
+    keys
+      .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
+      .slice(0, keys.length - REPLY_TARGETS_MAX)
+      .forEach(k => { delete targets[k]; });
+  }
+  ds.session.replyTargets = targets;
+
   if (ds.scope !== 'chat') return;
   if (replyRootId) {
     const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
@@ -126,20 +150,6 @@ export function beginReplyTargetTurn(
     ds.currentReplyTarget = target;
     ds.session.replyThreadAliases = aliases;
     ds.session.currentReplyTarget = target;
-    // Per-turn map alongside the single slot: a later turn's begin no longer
-    // strands this turn's anchor (session-only field — persisted by the
-    // sessionStore.updateSession the daemon calls right after every begin,
-    // same lifecycle as docCommentTargets).
-    const targets = { ...(ds.session.replyTargets ?? {}) };
-    targets[turnId] = { rootMessageId: replyRootId, updatedAt: nowIso, quoteOnly: opts?.quoteOnly, substitute: opts?.substitute };
-    const keys = Object.keys(targets);
-    if (keys.length > REPLY_TARGETS_MAX) {
-      keys
-        .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
-        .slice(0, keys.length - REPLY_TARGETS_MAX)
-        .forEach(k => { delete targets[k]; });
-    }
-    ds.session.replyTargets = targets;
     return;
   }
   ds.currentReplyTarget = undefined;
