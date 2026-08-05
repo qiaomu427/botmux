@@ -235,6 +235,15 @@ async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, 
  *
  * Returns `true` if scopes were successfully applied (caller should stop),
  * `false` to fall through to the manual DM warning.
+ *
+ * `opts.disableQrLogin` — when the only thing missing is a non-critical scope,
+ *   we still try to grab it (the automation imports the full manifest), but must
+ *   NOT pop a second QR code if the cached session is gone. Passing this makes a
+ *   missing/expired session fail cleanly (reason `invalid_session`) instead of
+ *   prompting a login.
+ * `opts.silent` — suppress the admin success DM (used for the opt-in / optional
+ *   path so a bot that never asked for the feature isn't pinged; the log line is
+ *   enough). Failures are always silent here regardless.
  */
 async function tryAutoFixScopes(
   larkAppId: string,
@@ -242,15 +251,18 @@ async function tryAutoFixScopes(
   brand: Brand,
   missingCritical: { name: string; desc: string }[],
   missingOptional: { name: string; desc: string }[],
+  opts?: { disableQrLogin?: boolean; silent?: boolean },
 ): Promise<boolean> {
   if (brand !== 'feishu') return false;
 
   try {
-    logger.info(`[${larkAppId}] attempting auto-fix for ${missingCritical.length} missing scopes via Open Platform...`);
+    const totalMissing = missingCritical.length + missingOptional.length;
+    logger.info(`[${larkAppId}] attempting auto-fix for ${totalMissing} missing scopes via Open Platform...`);
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
       brand,
       maxWaitMs: 60_000,
+      disableQrLogin: opts?.disableQrLogin,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -270,21 +282,23 @@ async function tryAutoFixScopes(
         `version ${result.versionId ?? 'n/a'} published, ` +
         `${result.subscribedEventCount} events subscribed`,
       );
+      // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
+      // never enabled the feature must not be pinged just because a non-critical
+      // scope was topped up in the background). The log line above is the record.
+      if (opts?.silent) return true;
       // Notify admin that auto-fix worked — even if im:message was missing before,
       // the newly published version should now have it.
       const adminOpenId = getAdminOpenId(bot);
       if (adminOpenId) {
-        const missingList = missingCritical.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
-        const optionalNote = missingOptional.length > 0
-          ? `\n\n另有 ${missingOptional.length} 项可选权限未开通：${missingOptional.map(s => s.name).join('、')}`
-          : '';
+        const fixedList = [...missingCritical, ...missingOptional];
+        const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
         await dmAdmin(
           larkAppId,
           adminOpenId,
           `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n${missingList}\n\n` +
           `${scopeDetail}，新版本已发布。\n` +
-          `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。${optionalNote}`,
-          `auto-fixed ${missingCritical.length} scopes`,
+          `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
+          `auto-fixed ${fixedList.length} scopes`,
         );
       }
       return true;
@@ -480,6 +494,23 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
 
     if (missingCritical.length === 0) {
+      // All critical scopes present. If an opt-in feature added a non-critical
+      // scope that isn't granted yet, top it up SILENTLY — but only when a cached
+      // Feishu web session already exists (disableQrLogin makes a missing session
+      // fail cleanly with no second QR code and no DM). This makes `botmux restart`
+      // actually pick up newly-declared optional scopes (e.g. the foreign-bot
+      // group-message scope) without the admin having to visit the Open Platform,
+      // while a bot with nothing missing — or no web session — behaves exactly as
+      // before (no API call / no prompt / no nag).
+      if (missingOptional.length > 0 && brand === 'feishu') {
+        const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
+          { disableQrLogin: true, silent: true });
+        if (toppedUp) {
+          logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
+          return;
+        }
+        logger.debug(`[${larkAppId}] optional scope(s) missing (${missingOptional.map(s => s.name).join('、')}); no cached web session to auto-apply — leaving to opt-in feature owner`);
+      }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
       return;
     }
