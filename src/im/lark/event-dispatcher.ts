@@ -849,9 +849,11 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
  * bot 专属信任；平台拉的团队群则经 platform: 前缀镜像进 team-groups，走同一个
  * isTeamGroupChat。两条路都算团队模式，都不需要 /grant。
  *
- * 调用方只剩 {@link evaluateBotTalk} 一个（bot 闸门的唯一入口）；(1) 的两条腿与
- * evaluateTalk 的 teamBot 腿重合，真正额外放行的是 (2)。保留本谓词是因为它是
- * 「bot 团队信任」的定义所在，且有专属单测（team-peer-trust / platform-team-trust）。
+ * 调用方有两个：{@link evaluateBotTalk}（bot talk 闸门的唯一入口）与
+ * {@link isForeignBotAutoStartPeer}（「其他 bot 开的新话题自动开工」的身份门）。前者里
+ * (1) 的两条腿与 evaluateTalk 的 teamBot 腿重合，真正额外放行的是 (2)；后者只取本谓词的
+ * 纯身份语义（叠加 isKnownPeerBot），刻意不碰 evaluateTalk 的 talk-open 腿。保留本谓词是
+ * 因为它是「bot 团队信任」的定义所在，且有专属单测（team-peer-trust / platform-team-trust）。
  */
 export function isTrustedTeamBotSender(
   dataDir: string,
@@ -861,6 +863,31 @@ export function isTrustedTeamBotSender(
   return isTeamBot(dataDir, senderUnionId)
     || isPlatformTeamBot(dataDir, senderUnionId)
     || isTeamGroupChat(dataDir, chatId);
+}
+
+/**
+ * 「其他机器人开的新话题自动开工」(autoStartOnNewTopic 场景② bot-sender 分支) 的 peer
+ * 门——**只认身份**，绝不掺 talk-open 腿。
+ *
+ * 刻意 NOT 复用 evaluateBotTalk(...).allowed：那是完整 talk 权限，除身份腿外还含
+ * open 模式 / oncall / allowedChatGroups 等**与 sender 身份无关**的整群 / 全开放放行腿。
+ * 拿它当「这是不是团队 / peer bot」的身份判据，会在默认的 open 模式（空 allowlist）下
+ * 把任意陌生外部 bot 放进来免 @ 自动开工，超出本特性「仅团队 / 已知 peer」的声明边界，
+ * 并因 handleNewTopic 首轮 quoteTarget=sender 打开对陌生 bot 的出站 @ 面。
+ *
+ * 放行 = 同部署兄弟 bot（{@link isKnownPeerBot}，cross-ref 学到的 open_id）∪ 跨部署团队
+ * peer（{@link isTrustedTeamBotSender}：union 锚定的 teamBot / 平台 roster / 团队拉群
+ * chat）。二者正是 evaluateBotTalk 的身份子集去掉 talk-open 腿。open_id 与 union_id 各按
+ * 自身域匹配（open_id 同 app 视角，union_id 租户稳定），任一命中即放行。
+ */
+export function isForeignBotAutoStartPeer(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId: string | undefined,
+): boolean {
+  return isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+    || isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId);
 }
 
 /** Update the per-bot cross-reference from @mention data in an event.
@@ -2748,19 +2775,42 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 掉——所以 bot 开的新话题永远到不了人分支的场景②。判定复用同一个纯函数
         // shouldAutoStartOnNewTopic（形态门：thread-scope + anchor===本消息 + 无会话
         // 占用，天然只认「全新话题种子」，不认话题内回复，故不会自我循环——回复锚定在
-        // 话题根 anchor≠messageId），触发范围额外收敛到 evaluateBotTalk 认可的团队 /
-        // 已知 peer bot（不放行任意陌生 bot），并要求飞书真的把这条非 @ 的 bot 消息推
-        // 过来（依赖 im:message.group_bot_msg:readonly scope；缺则事件根本不到，静默降级）。
+        // 话题根 anchor≠messageId），触发范围额外收敛到**只认身份**的
+        // isForeignBotAutoStartPeer（同部署兄弟 bot ∪ 跨部署团队 peer，不放行任意陌生
+        // bot；刻意不用 evaluateBotTalk 的完整 talk 权限，见下方 peer 门注释），并要求
+        // 飞书真的把这条非 @ 的 bot 消息推过来（依赖 im:message.group_bot_msg:readonly
+        // scope；缺则事件根本不到，静默降级）。
         //
         // 收到 im:message.group_bot_msg:readonly 推来的「其他机器人发的群消息」后，只有
         // 满足上述全部条件才免 @ 自动开工；否则保持原有「未 @ 即忽略」语义。
         if (!isBotMentioned(larkAppId, message, undefined)) {
           if (getBot(larkAppId).config.autoStartOnNewTopic === true && chatType === 'group') {
             const seedDecision = await decideRoutingWithSource(larkAppId, message);
-            // 与人分支 3041-3042 同源：只有真正的话题群顶层种子（source==='topic-chat'）
-            // 才是自动开工候选；普通群 /t / 新话题模式产生的同形 {thread, anchor=msg} 不算。
-            const seedScope = seedDecision.source === 'topic-chat' ? seedDecision.scope : 'chat';
-            const seedAnchor = seedDecision.source === 'topic-chat' ? seedDecision.anchor : chatId;
+            // P3 — 镜像人分支「话题群 → 普通群 (reverse conversion)」那道 forceRefresh
+            // 守卫：decideRoutingWithSource 判 topic-chat 种子靠的是**缓存** chat_mode
+            //（5min TTL）。管理员把话题群翻回普通群后缓存可能仍是 'topic'，于是一条本该
+            // 是普通群顶层的 bot 消息被误判成话题种子，起 thread-scope 会话把回复裹进
+            //「其实已是普通群」的新 Lark 话题。无真实 thread_id（= 种子形态，非既有话题内
+            // 回复，权威信号不会 stale）时用 forceRefresh 再确认；飞书现在报 'group' 就当
+            // 它不是话题种子（降级），不自动开工。这道 API 往返只落在「已呈现 topic 种子
+            // 形态的 opt-in 候选」上——与人分支同样的成本取舍（宁可多一次调用，也不用
+            // 一个 5min 错建 session 的窗口换省一次调用）。
+            let seedIsTopicChat = seedDecision.source === 'topic-chat';
+            if (seedIsTopicChat && !message.thread_id) {
+              const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+              if (freshMode === 'group') {
+                logger.info(
+                  `[chat-mode-converted] ${chatId.substring(0, 12)} chat_mode flipped 'topic' → 'group'; ` +
+                  `跳过 bot 新话题自动开工 msg=${messageId.substring(0, 12)}`,
+                );
+                seedIsTopicChat = false;
+              }
+            }
+            // 与人分支同源：只有真正的话题群顶层种子（source==='topic-chat' 且经 forceRefresh
+            // 复核仍是话题群）才是自动开工候选；普通群 /t / 新话题模式产生的同形
+            // {thread, anchor=msg} 不算。
+            const seedScope = seedIsTopicChat ? seedDecision.scope : 'chat';
+            const seedAnchor = seedIsTopicChat ? seedDecision.anchor : chatId;
             const seedOwnsSession = seedScope === 'thread'
               ? (handlers.isSessionOwner?.(seedAnchor, larkAppId) ?? false)
               : false;
@@ -2773,11 +2823,22 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               ownsSession: seedOwnsSession,
             });
             // peer 门：只对团队 / 已知 peer bot 开的新话题自动开工，不放行陌生 bot。
-            const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
-            if (autoTopic && seedBotTalk.allowed) {
+            //
+            // ⚠️ 必须用**只认身份**的谓词，不能用 evaluateBotTalk(...).allowed：后者是
+            // 完整 talk 权限，除身份腿（peer / teamBot）外还含 talk-open 腿——open 模式
+            // （空 allowlist，是默认态）、oncall 群、allowedChatGroups——这些**不看 sender
+            // 身份**，会把任意陌生外部 bot 放进来免 @ 自动开工，超出「仅团队 / 已知 peer」
+            // 的声明边界（dashboard 文案与本特性设计意图）。这里改用 isForeignBotAutoStartPeer：
+            //   · isKnownPeerBot        — 同部署兄弟 bot（cross-ref 学到的 open_id）
+            //   · isTrustedTeamBotSender — 跨部署团队 peer（union 锚定的 teamBot / 平台
+            //                              roster / 团队拉群 chat）
+            // 恰好是 evaluateBotTalk 的身份子集去掉 talk-open 腿。新增 talk 源改
+            // evaluateTalk 不影响这里，本闸门永远只认身份。
+            const seedIsPeer = isForeignBotAutoStartPeer(larkAppId, chatId, senderOpenId, senderUnionId);
+            if (autoTopic && seedIsPeer) {
               logger.info(
                 `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题免@自动开工 ` +
-                `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'} reason=${seedBotTalk.reason}`,
+                `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
               );
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
               await dispatchHumanMessage({ data, ctx: seedCtx, ownsSession: false })

@@ -5842,8 +5842,8 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
    *  exercises the auto-topic branch rather than an open-mode relaxation. */
   function setupAutoTopicBotSender(enabled: boolean, knownPeer: boolean) {
     setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: enabled });
-    // knownPeer → cross-ref hit → isKnownPeerBot true → evaluateBotTalk allows.
-    // Otherwise the foreign bot is unknown → peer gate rejects.
+    // knownPeer → cross-ref hit → isKnownPeerBot true → isForeignBotAutoStartPeer
+    // 放行（身份腿）。否则该外部 bot 未知 → 身份门拒绝。
     mockReadFileSync.mockReturnValue(knownPeer ? JSON.stringify({ SiblingBot: OTHER_BOT_OPEN_ID }) : '{}');
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   }
@@ -5969,6 +5969,87 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
       larkAppId: MY_APP_ID,
     }));
     expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  // ── P1 回归矩阵：身份门 vs talk-open 门 ──────────────────────────────
+  // peer 门必须**只认身份**（isKnownPeerBot ∪ isTrustedTeamBotSender）。曾经用
+  // evaluateBotTalk(...).allowed，它是完整 talk 权限，含 open / oncall /
+  // allowedChatGroups 等**与 sender 身份无关**的放行腿——会把任意陌生外部 bot 放进来
+  // 免 @ 自动开工，超出「仅团队 / 已知 peer」的声明边界。以下三例锁住：这些 talk-open
+  // 配置下，**未知** bot 的新话题一律不自动开工。（改回 evaluateBotTalk 立即变红。）
+
+  it('P1: open 模式（空 allowlist）+ 未知 bot 新话题 → 不触发（talk-open 不是身份门）', async () => {
+    // 空 allowlist = 默认态：evaluateTalk 会回 {allowed:true, reason:'open'} 对任意 sender。
+    // 身份门 isForeignBotAutoStartPeer 不看它 → 未知 bot 不放行。
+    setupBotState({ autoStartOnNewTopic: true }); // 无 allowedUsers / chatGroups / grants
+    mockReadFileSync.mockReturnValue('{}');       // 无 cross-ref → 非 known peer
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeBotTopicSeed('msg-bot-open-unknown', 'chat-bot-open-unknown');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('P1: oncall 群 + 未知 bot 新话题 → 不触发（oncall 是 talk-open 非身份）', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: true });
+    mockReadFileSync.mockReturnValue('{}');       // 非 known peer
+    mockFindOncallChat.mockReturnValue({ chatId: 'chat-bot-oncall-unknown', workingDir: '/repo' });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeBotTopicSeed('msg-bot-oncall-unknown', 'chat-bot-oncall-unknown');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('P1: allowedChatGroups 整群授权 + 未知 bot 新话题 → 不触发（整群 talk-open 非身份）', async () => {
+    setupBotState({
+      allowedUsers: ['ou_owner'],
+      allowedChatGroups: ['chat-bot-grantgroup-unknown'],
+      autoStartOnNewTopic: true,
+    });
+    mockReadFileSync.mockReturnValue('{}');       // 非 known peer
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeBotTopicSeed('msg-bot-grantgroup-unknown', 'chat-bot-grantgroup-unknown');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('P3: chat_mode 缓存 topic 但 forceRefresh 报 group（话题群翻回普通群窗口内）→ 不触发', async () => {
+    // decideRoutingWithSource 用缓存 chat_mode 判 topic-chat 种子；管理员翻回普通群后
+    // 缓存仍可能是 'topic'。新分支镜像人分支：无真实 thread_id 时用 forceRefresh 复核，
+    // 现在报 'group' → 当它不是话题种子，不自动开工（防在已是普通群里错建 thread 会话）。
+    setupAutoTopicBotSender(true, true); // known peer，身份门放行，隔离出 chat_mode 这一维
+    // 按 forceRefresh 参数分支（而非调用次序）：缓存读返回 'topic' 让 decideRouting 判成
+    // topic 种子；带 {forceRefresh:true} 的复核返回 'group'。这样即便去掉复核那次调用、
+    // 或调用次序变了，测试也不会假绿——它锁的是「本分支必须用 forceRefresh 复核并尊重
+    // 其 'group' 结论」这条语义本身。
+    mockGetChatMode.mockReset();
+    mockGetChatMode.mockImplementation(
+      async (_appId: string, _chatId: string, options?: { forceRefresh?: boolean }) =>
+        options?.forceRefresh ? 'group' : 'topic',
+    );
+    const event = makeBotTopicSeed('msg-bot-flipped-group', 'chat-bot-flipped-group');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    // 明确断言这条 forceRefresh 复核真的发生过（否则「删掉 options / 不复核」会假绿）。
+    const forceRefreshCalls = mockGetChatMode.mock.calls.filter(
+      ([, , options]) => (options as { forceRefresh?: boolean } | undefined)?.forceRefresh === true,
+    );
+    expect(forceRefreshCalls.length).toBeGreaterThanOrEqual(1);
   });
 });
 
