@@ -2780,11 +2780,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // shouldAutoStartOnNewTopic（形态门：thread-scope + anchor===本消息 + 无会话
         // 占用，天然只认「全新话题种子」，不认话题内回复，故不会自我循环——回复锚定在
         // 话题根 anchor≠messageId），并要求飞书真的把这条非 @ 的 bot 消息推过来
-        //（依赖 im:message.group_bot_msg:readonly scope；缺则事件根本不到，静默降级）。
+        //（依赖 im:message.group_msg.include_bot:read scope；缺则事件根本不到，静默降级）。
         // sender 不 gate：任何机器人（含陌生 bot）开的新话题都自动开工，与人分支同源。
         //
-        // 收到 im:message.group_bot_msg:readonly 推来的「其他机器人发的群消息」后，只有
-        // 满足形态门才免 @ 自动开工；否则保持原有「未 @ 即忽略」语义。
+        // 收到 im:message.group_msg.include_bot:read 推来的「其他用户/机器人发的群消息」后，
+        // 只有满足形态门才免 @ 自动开工；否则保持原有「未 @ 即忽略」语义。
         if (!isBotMentioned(larkAppId, message, undefined)) {
           if (getBot(larkAppId).config.autoStartOnNewTopic === true && chatType === 'group') {
             const seedDecision = await decideRoutingWithSource(larkAppId, message);
