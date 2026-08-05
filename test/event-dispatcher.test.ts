@@ -5838,12 +5838,13 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
   });
 
   /** setupBotState with a non-empty allowlist (limited mode) that excludes the
-   *  foreign bot, so a non-@ bot message deterministically returns 'ignore' and
-   *  exercises the auto-topic branch rather than an open-mode relaxation. */
+   *  foreign bot. The auto-start branch no longer gates on sender identity
+   *  (any person/bot opening a topic triggers it), so `knownPeer` only controls
+   *  whether the cross-ref file is seeded — kept as a param so both "cross-ref
+   *  present" and "totally unknown bot" shapes are exercised, but it does NOT
+   *  change whether auto-start fires. */
   function setupAutoTopicBotSender(enabled: boolean, knownPeer: boolean) {
     setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: enabled });
-    // knownPeer → cross-ref hit → isKnownPeerBot true → isForeignBotAutoStartPeer
-    // 放行（身份腿）。否则该外部 bot 未知 → 身份门拒绝。
     mockReadFileSync.mockReturnValue(knownPeer ? JSON.stringify({ SiblingBot: OTHER_BOT_OPEN_ID }) : '{}');
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   }
@@ -5892,15 +5893,21 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
-  it('陌生外部 bot（非 peer）开新话题（未 @）+ 开关开 → 不触发（peer 门挡住）', async () => {
-    setupAutoTopicBotSender(true, false);
+  it('陌生外部 bot（无 cross-ref）开新话题（未 @）+ 开关开 → 自动开工（不再有 peer 门）', async () => {
+    // 产品决策：自动开工不限团队/已知 peer，任何机器人（含从未学到 cross-ref 的陌生 bot）
+    // 开的新话题都免 @ 自动接入。此前的「peer 门挡陌生 bot」已移除。
+    setupAutoTopicBotSender(true, false); // 无 cross-ref → 完全陌生的外部 bot
     const event = makeBotTopicSeed('msg-bot-seed-stranger', 'chat-bot-topic-stranger');
 
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
 
-    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-seed-stranger',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
   it('peer bot 话题内回复（有 root_id+thread_id，非新话题种子）→ 不触发（形态门 = 防自我循环的核心）', async () => {
@@ -5961,7 +5968,7 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
 
-    // @ 到 + peer 放行 → 既有 bot @mention 路径（handleThreadReply, anchor=种子 msgId），
+    // @ 到本 bot → 既有 bot @mention 路径（handleThreadReply, anchor=种子 msgId），
     // 而不是被本次新增的「未 @ 自动开工」分支处理（那条分支的 return 出口在 isBotMentioned 为真时不进入）。
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'thread',
@@ -5971,64 +5978,34 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
-  // ── P1 回归矩阵：身份门 vs talk-open 门 ──────────────────────────────
-  // peer 门必须**只认身份**（isKnownPeerBot ∪ isTrustedTeamBotSender）。曾经用
-  // evaluateBotTalk(...).allowed，它是完整 talk 权限，含 open / oncall /
-  // allowedChatGroups 等**与 sender 身份无关**的放行腿——会把任意陌生外部 bot 放进来
-  // 免 @ 自动开工，超出「仅团队 / 已知 peer」的声明边界。以下三例锁住：这些 talk-open
-  // 配置下，**未知** bot 的新话题一律不自动开工。（改回 evaluateBotTalk 立即变红。）
+  // ── 触发面：sender 不 gate ──────────────────────────────
+  // 自动开工不限团队/已知 peer——任何机器人开的新话题都触发，与 allowlist / oncall /
+  // allowedChatGroups 等 talk 配置无关。下面用默认 open 态 + 完全陌生 bot 兜底证明。
 
-  it('P1: open 模式（空 allowlist）+ 未知 bot 新话题 → 不触发（talk-open 不是身份门）', async () => {
-    // 空 allowlist = 默认态：evaluateTalk 会回 {allowed:true, reason:'open'} 对任意 sender。
-    // 身份门 isForeignBotAutoStartPeer 不看它 → 未知 bot 不放行。
+  it('open 模式（空 allowlist，默认态）+ 未知 bot 新话题 → 自动开工（sender 不 gate）', async () => {
+    // 自动开工不 gate sender：任何机器人开的新话题都触发，与 allowlist / oncall /
+    // allowedChatGroups 等 talk 配置无关。此处用默认 open 态 + 完全陌生 bot 兜底证明
+    // 触发面不受这些配置影响（早期一版曾在这里加 peer 身份门，已按产品决策移除）。
     setupBotState({ autoStartOnNewTopic: true }); // 无 allowedUsers / chatGroups / grants
-    mockReadFileSync.mockReturnValue('{}');       // 无 cross-ref → 非 known peer
+    mockReadFileSync.mockReturnValue('{}');       // 无 cross-ref → 完全陌生的外部 bot
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
     const event = makeBotTopicSeed('msg-bot-open-unknown', 'chat-bot-open-unknown');
 
     await capturedHandlers['im.message.receive_v1'](event);
     await flushEventWork();
 
-    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
-  });
-
-  it('P1: oncall 群 + 未知 bot 新话题 → 不触发（oncall 是 talk-open 非身份）', async () => {
-    setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: true });
-    mockReadFileSync.mockReturnValue('{}');       // 非 known peer
-    mockFindOncallChat.mockReturnValue({ chatId: 'chat-bot-oncall-unknown', workingDir: '/repo' });
-    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
-    const event = makeBotTopicSeed('msg-bot-oncall-unknown', 'chat-bot-oncall-unknown');
-
-    await capturedHandlers['im.message.receive_v1'](event);
-    await flushEventWork();
-
-    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
-  });
-
-  it('P1: allowedChatGroups 整群授权 + 未知 bot 新话题 → 不触发（整群 talk-open 非身份）', async () => {
-    setupBotState({
-      allowedUsers: ['ou_owner'],
-      allowedChatGroups: ['chat-bot-grantgroup-unknown'],
-      autoStartOnNewTopic: true,
-    });
-    mockReadFileSync.mockReturnValue('{}');       // 非 known peer
-    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
-    const event = makeBotTopicSeed('msg-bot-grantgroup-unknown', 'chat-bot-grantgroup-unknown');
-
-    await capturedHandlers['im.message.receive_v1'](event);
-    await flushEventWork();
-
-    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-open-unknown',
+      larkAppId: MY_APP_ID,
+    }));
   });
 
   it('P3: chat_mode 缓存 topic 但 forceRefresh 报 group（话题群翻回普通群窗口内）→ 不触发', async () => {
     // decideRoutingWithSource 用缓存 chat_mode 判 topic-chat 种子；管理员翻回普通群后
     // 缓存仍可能是 'topic'。新分支镜像人分支：无真实 thread_id 时用 forceRefresh 复核，
     // 现在报 'group' → 当它不是话题种子，不自动开工（防在已是普通群里错建 thread 会话）。
-    setupAutoTopicBotSender(true, true); // known peer，身份门放行，隔离出 chat_mode 这一维
+    setupAutoTopicBotSender(true, true); // cross-ref 有无都不影响触发，此处隔离出 chat_mode 这一维
     // 按 forceRefresh 参数分支（而非调用次序）：缓存读返回 'topic' 让 decideRouting 判成
     // topic 种子；带 {forceRefresh:true} 的复核返回 'group'。这样即便去掉复核那次调用、
     // 或调用次序变了，测试也不会假绿——它锁的是「本分支必须用 forceRefresh 复核并尊重
