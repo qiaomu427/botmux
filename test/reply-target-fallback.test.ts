@@ -160,6 +160,21 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(resolveSessionReplyTarget(ds, 'turn-a')).toEqual({ mode: 'thread', rootMessageId: 'om_thread_root' });
   });
 
+  it('thread-scope substitute turns keep their streaming card', () => {
+    const ds = makeDs({ scope: 'thread' }) as DaemonSession;
+    beginReplyTargetTurn(ds, undefined, 'turn-sub', NOW, {
+      substitute: true,
+      senderOpenId: 'ou_sender',
+    });
+
+    expect(ds.session.replyTargets?.['turn-sub']).toMatchObject({
+      substitute: true,
+      senderOpenId: 'ou_sender',
+    });
+    expect(isSubstituteTurn(ds, 'turn-sub')).toBe(false);
+    expect(isSubstituteTurn(ds)).toBe(false);
+  });
+
   it('keeps rootless chat sender A separate from topic sender/root B', () => {
     const ds = makeDs() as DaemonSession;
     beginReplyTargetTurn(ds, undefined, 'turn-a', NOW, { senderOpenId: 'ou_a' });

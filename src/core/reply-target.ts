@@ -43,14 +43,16 @@ export function pickTurnReplyTarget(
   return s.currentReplyTarget;
 }
 
-/** Whether `turnId` is a substitute (avatar-style) turn. With no turn context,
- *  falls back to the latest-accepted turn's flag — callers that have a turnId
- *  (screen updates, turn reactions) get an exact per-turn answer so a queued
- *  normal turn doesn't inherit a substitute turn's card-off (or vice versa). */
+/** Whether `turnId` is a chat-scope substitute turn that disables the
+ * streaming card. Thread-scope substitute turns keep their normal card. With
+ * no turn context, falls back to the latest-accepted chat turn's flag; callers
+ * with a turnId get an exact per-turn answer so queued normal/substitute turns
+ * cannot inherit each other's card state. */
 export function isSubstituteTurn(
-  ds: Pick<DaemonSession, 'session' | 'currentReplyTarget'>,
+  ds: Pick<DaemonSession, 'scope' | 'session' | 'currentReplyTarget'>,
   turnId?: string,
 ): boolean {
+  if (ds.scope !== 'chat') return false;
   const slot = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
   if (turnId) {
     const entry = ds.session.replyTargets?.[turnId];
